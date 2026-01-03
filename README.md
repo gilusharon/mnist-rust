@@ -6,9 +6,9 @@ A neural network implementation for classifying handwritten digits from the MNIS
 
 - **3-layer fully connected neural network** with ReLU activations
 - **Automatic MNIST dataset loading** via `candle-datasets`
-- **Training and evaluation** modes
 - **Model persistence** using safetensors format
 - **Configurable hyperparameters** via command-line arguments
+- **Hands on testing** with a drawing app
 
 ## Architecture
 
