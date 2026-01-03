@@ -4,7 +4,7 @@ use candle_nn::{loss, Linear, Module, Optimizer, VarBuilder, VarMap};
 use candle_datasets::vision::mnist;
 use clap::{Parser, ValueEnum};
 use eframe::egui;
-use image::{GrayImage, ImageBuffer, Luma};
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -104,40 +104,32 @@ fn train(
     Ok(())
 }
 
-fn test(model: &Model, test_images: &Tensor, test_labels: &Tensor) -> Result<()> {
-    println!("Evaluating on test set...");
-    
-    let logits = model.forward(test_images)?;
-    let predictions = logits.argmax(1).map_err(anyhow::Error::from)?;    
-    let test_labels_1d = if test_labels.rank() > 1 {
-        test_labels.flatten_all().map_err(anyhow::Error::from)?
-    } else {
-        test_labels.clone()
-    };
-    let test_labels_u32 = test_labels_1d.to_dtype(candle_core::DType::U32).map_err(anyhow::Error::from)?;
-    let correct = predictions
-        .eq(&test_labels_u32).map_err(anyhow::Error::from)?
-        .to_vec1::<u8>().map_err(anyhow::Error::from)?;
-    
-    let accuracy = correct.iter().map(|&x| x as f64).sum::<f64>() / correct.len() as f64;
-    println!("Test Accuracy: {:.2}%", accuracy * 100.0);
-
-    Ok(())
-}
-
 struct DrawingApp {
     canvas: Vec<Vec<bool>>,
     is_drawing: bool,
     brush_size: f32,
+    device: Device,
+    dataset: Option<(Tensor, Tensor, Tensor, Tensor)>,
+    varmap: Arc<Mutex<VarMap>>,
+    model: Option<Arc<Model>>,
+    training_status: String,
+    prediction: Option<u32>,
 }
 
 impl DrawingApp {
-    fn new() -> Self {
-        Self {
-            canvas: vec![vec![false; 280]; 280], // 280x280 canvas, will be downscaled to 28x28
+    fn new() -> Result<Self> {
+        let device = Device::cuda_if_available(0)?;
+        Ok(Self {
+            canvas: vec![vec![false; 280]; 280],
             is_drawing: false,
             brush_size: 10.0,
-        }
+            device,
+            dataset: None,
+            varmap: Arc::new(Mutex::new(VarMap::new())),
+            model: None,
+            training_status: String::new(),
+            prediction: None,
+        })
     }
 
     fn clear(&mut self) {
@@ -160,12 +152,12 @@ impl DrawingApp {
         }
     }
 
-    fn save_as_jpeg(&self, filename: &str) -> Result<()> {
-        let mut img: GrayImage = ImageBuffer::new(28, 28);
-        
+    fn canvas_to_tensor(&self) -> Result<Tensor> {
+        // Convert canvas to 28x28 grayscale values (0.0 to 1.0)
+        // Invert colors: drawn pixels (black in UI) become white (1.0), background becomes black (0.0)
+        let mut pixels = Vec::new();
         for y in 0..28 {
             for x in 0..28 {
-                // Sample from 10x10 region in the canvas
                 let mut sum = 0u32;
                 let mut count = 0u32;
                 
@@ -182,22 +174,191 @@ impl DrawingApp {
                     }
                 }
                 
-                let avg = if count > 0 { (sum / count) as u8 } else { 0 };
-                img.put_pixel(x as u32, y as u32, Luma([avg]));
+                // Invert: drawn pixels become 1.0 (white), background becomes 0.0 (black)
+                let avg = if count > 0 { (sum / count) as f32 / 255.0 } else { 0.0 };
+                pixels.push(avg);
             }
         }
         
-        // Save as JPEG
-        img.save(filename)?;
-        println!("Saved drawing to {}", filename);
+        // Create tensor: shape [1, 28, 28] for a single image
+        Tensor::from_slice(&pixels, &[1, 28, 28], &self.device)
+            .map_err(anyhow::Error::from)
+    }
+
+    fn identify_digit(&mut self) -> Result<()> {
+        if self.model.is_none() {
+            self.training_status = "Error: Please load or train a model first".to_string();
+            return Ok(());
+        }
+
+        let image_tensor = self.canvas_to_tensor()?;
+        let model = self.model.as_ref().unwrap();
+        
+        let logits = model.forward(&image_tensor)?;
+        let prediction_tensor = logits.argmax(1).map_err(anyhow::Error::from)?;
+        
+        // argmax(1) returns shape [1], so we need to get the first element
+        let prediction = prediction_tensor
+            .to_vec1::<u32>()
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Empty prediction tensor"))?;
+        
+        self.prediction = Some(prediction);
+        self.training_status = format!("Identified as: {}", prediction);
         Ok(())
+    }
+
+    fn load_model(&mut self) -> Result<()> {
+        let mut varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &self.device);
+        let model = Model::new(vs)?;       
+        let tensors = candle_core::safetensors::load("model.safetensors", &self.device)
+            .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?;
+        
+        varmap.set(tensors.iter().map(|(k, v)| (k, v)))
+            .map_err(|e| anyhow::anyhow!("Failed to set model parameters: {}", e))?;
+        
+        self.varmap = Arc::new(Mutex::new(varmap));
+        self.model = Some(Arc::new(model));
+        self.training_status = "Model loaded successfully".to_string();
+        Ok(())
+    }
+
+    fn train_model(&mut self, epochs: usize, batch_size: usize, learning_rate: f64) {
+        // Load dataset if not already loaded
+        if self.dataset.is_none() {
+            self.training_status = "Loading dataset...".to_string();
+            let dataset = match mnist::load() {
+                Ok(d) => d,
+                Err(e) => {
+                    self.training_status = format!("Error loading dataset: {}", e);
+                    return;
+                }
+            };
+            
+            let train_images = match dataset.train_images.to_device(&self.device) {
+                Ok(img) => img,
+                Err(e) => {
+                    self.training_status = format!("Error moving train images to device: {}", e);
+                    return;
+                }
+            };
+            let test_images = match dataset.test_images.to_device(&self.device) {
+                Ok(img) => img,
+                Err(e) => {
+                    self.training_status = format!("Error moving test images to device: {}", e);
+                    return;
+                }
+            };
+            let train_labels = match dataset.train_labels.to_device(&self.device) {
+                Ok(lbl) => lbl,
+                Err(e) => {
+                    self.training_status = format!("Error moving train labels to device: {}", e);
+                    return;
+                }
+            };
+            let test_labels = match dataset.test_labels.to_device(&self.device) {
+                Ok(lbl) => lbl,
+                Err(e) => {
+                    self.training_status = format!("Error moving test labels to device: {}", e);
+                    return;
+                }
+            };
+            
+            let train_images = match train_images.to_dtype(candle_core::DType::F32) {
+                Ok(img) => img,
+                Err(e) => {
+                    self.training_status = format!("Error converting train images: {}", e);
+                    return;
+                }
+            };
+            let test_images = match test_images.to_dtype(candle_core::DType::F32) {
+                Ok(img) => img,
+                Err(e) => {
+                    self.training_status = format!("Error converting test images: {}", e);
+                    return;
+                }
+            };
+            let train_labels = match train_labels.to_dtype(candle_core::DType::U32) {
+                Ok(lbl) => lbl,
+                Err(e) => {
+                    self.training_status = format!("Error converting train labels: {}", e);
+                    return;
+                }
+            };
+            let test_labels = match test_labels.to_dtype(candle_core::DType::U32) {
+                Ok(lbl) => lbl,
+                Err(e) => {
+                    self.training_status = format!("Error converting test labels: {}", e);
+                    return;
+                }
+            };
+            
+            self.dataset = Some((train_images, train_labels, test_images, test_labels));
+            self.training_status = "Dataset loaded, starting training...".to_string();
+        }
+
+        let (train_images, train_labels, _, _) = self.dataset.as_ref().unwrap();
+        let mut varmap_guard = self.varmap.lock().unwrap();
+        
+        if self.model.is_none() {
+            let vs = VarBuilder::from_varmap(&*varmap_guard, candle_core::DType::F32, &self.device);
+            match Model::new(vs) {
+                Ok(model) => {
+                    self.model = Some(Arc::new(model));
+                }
+                Err(e) => {
+                    self.training_status = format!("Error creating model: {}", e);
+                    return;
+                }
+            }
+        }
+
+        let model = self.model.as_ref().unwrap();
+        
+        match train(model, train_images, train_labels, epochs, batch_size, learning_rate, &mut *varmap_guard) {
+            Ok(()) => {
+                let tensors = varmap_guard.data().lock().unwrap().iter()
+                    .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
+                    .collect::<std::collections::HashMap<String, Tensor>>();
+                
+                if let Err(e) = candle_core::safetensors::save(&tensors, "model.safetensors") {
+                    self.training_status = format!("Error saving model: {}", e);
+                } else {
+                    self.training_status = format!("Training completed and model saved");
+                }
+            }
+            Err(e) => {
+                self.training_status = format!("Training error: {}", e);
+            }
+        }
     }
 }
 
 impl eframe::App for DrawingApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Draw a Digit (28x28)");
+            ui.heading("MNIST Classifier - Draw & Train");
+            
+            ui.horizontal(|ui| {
+                if ui.button("Load Model").clicked() {
+                    if let Err(e) = self.load_model() {
+                        self.training_status = format!("Error loading model: {}", e);
+                    }
+                }
+                
+                if ui.button("Train").clicked() {
+                    self.train_model(10, 64, 0.01);
+                }
+            });
+            
+            if !self.training_status.is_empty() {
+                ui.label(&self.training_status);
+            }
+            
+            ui.separator();
             
             ui.horizontal(|ui| {
                 ui.label("Brush Size:");
@@ -207,25 +368,29 @@ impl eframe::App for DrawingApp {
             ui.horizontal(|ui| {
                 if ui.button("Clear").clicked() {
                     self.clear();
+                    self.prediction = None;
                 }
                 
-                if ui.button("Save as JPEG").clicked() {
-                    if let Err(e) = self.save_as_jpeg("drawn_digit.jpg") {
-                        eprintln!("Error saving: {}", e);
+                if ui.button("Identify").clicked() {
+                    if let Err(e) = self.identify_digit() {
+                        self.training_status = format!("Error identifying: {}", e);
                     }
                 }
             });
             
+            if let Some(pred) = self.prediction {
+                ui.heading(format!("Prediction: {}", pred));
+            }
+            
             ui.separator();
             
-            // Drawing canvas
             let (response, painter) = ui.allocate_painter(
                 egui::Vec2::new(280.0, 280.0),
                 egui::Sense::click_and_drag(),
             );
             
             let canvas_rect = response.rect;
-            painter.rect_filled(canvas_rect, 0.0, egui::Color32::WHITE);
+            painter.rect_filled(canvas_rect, 0.0, egui::Color32::BLACK);
             
             painter.line_segment(
                 [canvas_rect.min, egui::pos2(canvas_rect.min.x, canvas_rect.max.y)],
@@ -244,7 +409,6 @@ impl eframe::App for DrawingApp {
                 egui::Stroke::new(1.0, egui::Color32::from_gray(200)),
             );
             
-            // Handle mouse input
             if response.dragged() {
                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                     let local_pos = pointer_pos - canvas_rect.min;
@@ -271,7 +435,6 @@ impl eframe::App for DrawingApp {
                 self.is_drawing = false;
             }
             
-            // Draw the canvas pixels
             for y in 0..280 {
                 for x in 0..280 {
                     if self.canvas[y][x] {
@@ -279,7 +442,7 @@ impl eframe::App for DrawingApp {
                             canvas_rect.min + egui::vec2(x as f32, y as f32),
                             egui::Vec2::new(1.0, 1.0),
                         );
-                        painter.rect_filled(pixel_rect, 0.0, egui::Color32::BLACK);
+                        painter.rect_filled(pixel_rect, 0.0, egui::Color32::WHITE);
                     }
                 }
             }
@@ -289,39 +452,22 @@ impl eframe::App for DrawingApp {
     }
 }
 
-fn draw_digit() -> Result<()> {
+fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([400.0, 500.0])
-            .with_title("Draw a Digit"),
+            .with_inner_size([400.0, 600.0])
+            .with_title("MNIST Classifier"),
         ..Default::default()
     };
     
     eframe::run_native(
-        "Draw a Digit",
+        "MNIST Classifier",
         options,
-        Box::new(|_cc| Box::new(DrawingApp::new())),
-    ).map_err(|e| anyhow::anyhow!("Failed to run drawing app: {}", e))?;
+        Box::new(|_cc| {
+            Box::new(DrawingApp::new().expect("Failed to create app"))
+        }),
+    ).map_err(|e| anyhow::anyhow!("Failed to run app: {:?}", e))?;
     
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let device = Device::cuda_if_available(0)?;
-    let dataset = mnist::load().map_err(anyhow::Error::from)?;
-    let train_images = dataset.train_images.to_device(&device)?.to_dtype(candle_core::DType::F32)?;
-    let test_images = dataset.test_images.to_device(&device)?.to_dtype(candle_core::DType::F32)?;
-    let train_labels = dataset.train_labels.to_device(&device)?.to_dtype(candle_core::DType::U32)?;
-    let test_labels = dataset.test_labels.to_device(&device)?.to_dtype(candle_core::DType::U32)?;
-    let mut varmap = VarMap::new();
-    let model = Model::new(VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device))?;
-    train(&model, &train_images, &train_labels, args.epochs, args.batch_size, args.learning_rate, &mut varmap)?;
-    test(&model, &test_images, &test_labels)?;
-    let tensors = varmap.data().lock().unwrap().iter()
-    .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
-    .collect::<std::collections::HashMap<String, Tensor>>();
-    candle_core::safetensors::save(&tensors, "model.safetensors")?;
     Ok(())
 }
 
